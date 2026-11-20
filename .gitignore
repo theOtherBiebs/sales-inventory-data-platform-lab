@@ -1,0 +1,5 @@
+# Generated inputs/outputs; reproduce via python -B sales_inventory_lab.py run
+data/
+__pycache__/
+*.py[cod]
+.tmp*/
