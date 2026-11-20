@@ -14,7 +14,7 @@ PRODUCTS = {
     "P200": "Pantry",
     "F300": "Frozen",
 }
-SALES_FIELDS = ("event_id", "date", "sku", "units", "unit_price_cents")
+SALES_FIELDS = ("event_id", "date", "sku", "units", "unit_price_cents", "source_version")
 INVENTORY_FIELDS = ("date", "sku", "on_hand")
 
 
@@ -49,14 +49,14 @@ def generate(root: Path):
             ("F300", 3, 600, 10 - day),
         ):
             sales.append(dict(event_id=f"S{day:02d}-{sku}", date=day_str,
-                              sku=sku, units=units, unit_price_cents=price))
+                              sku=sku, units=units, unit_price_cents=price, source_version=1))
             inventory.append(dict(date=day_str, sku=sku, on_hand=stock))
-    # Deliberate correction: latest valid occurrence of this event wins.
+    # Deliberate correction: highest valid source version wins, regardless of file order.
     sales.append(dict(event_id="S00-P100", date=start.isoformat(), sku="P100",
-                      units=4, unit_price_cents=350))
+                      units=4, unit_price_cents=350, source_version=2))
     # Deliberate bad reference: retained in bronze, rejected from silver.
     sales.append(dict(event_id="BAD-SKU", date=start.isoformat(), sku="X999",
-                      units=2, unit_price_cents=100))
+                      units=2, unit_price_cents=100, source_version=1))
     write_csv(root / "data/landing/sales.csv", SALES_FIELDS, sales)
     write_csv(root / "data/landing/inventory.csv", INVENTORY_FIELDS, inventory)
 
@@ -84,8 +84,9 @@ def validate_sales(row):
         raise ValueError("unknown sku")
     units = positive_int(row["units"], "units")
     price = positive_int(row["unit_price_cents"], "unit_price_cents")
+    version = positive_int(row["source_version"], "source_version")
     return dict(event_id=row["event_id"], date=row["date"], sku=row["sku"],
-                units=units, unit_price_cents=price)
+                units=units, unit_price_cents=price, source_version=version)
 
 
 def validate_inventory(row):
@@ -108,6 +109,7 @@ def build(root: Path):
     rejected = []
     counts = {"sales_duplicates": 0, "inventory_duplicates": 0}
     sales = {}
+    seen_sales_versions = {}
     inventory = {}
     for name, fields, validator, target, key_fn in (
         ("sales", SALES_FIELDS, validate_sales, sales, lambda r: r["event_id"]),
@@ -124,7 +126,19 @@ def build(root: Path):
             key = key_fn(row)
             if key in target:
                 counts[f"{name}_duplicates"] += 1
-            target[key] = row  # Last valid occurrence wins within each input.
+            if name == "sales":
+                version_key = (key, row["source_version"])
+                previous_version = seen_sales_versions.get(version_key)
+                if previous_version is not None:
+                    if row != previous_version:
+                        raise ValueError(f"conflicting sales event_id {key!r} at "
+                                         f"source_version {row['source_version']}; "
+                                         "cannot choose a winner")
+                    continue  # Identical replay is idempotent at any version.
+                seen_sales_versions[version_key] = row
+                if key in target and row["source_version"] < target[key]["source_version"]:
+                    continue  # Late older revision cannot undo a correction.
+            target[key] = row  # Inventory retains last-valid-row behavior.
 
     write_csv(root / "data/silver/sales.csv", SALES_FIELDS,
               sorted(sales.values(), key=lambda r: (r["date"], r["event_id"])))
